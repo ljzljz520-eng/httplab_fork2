@@ -1,2 +1,8 @@
 *_amd64
 .httplab
+
+# security runtime artifacts: KEK, audit log, encrypted captures, local policy
+.httplab.key
+.httplab.audit.log
+.httplab.captures/
+.httplab.policy.json

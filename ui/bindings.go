@@ -65,7 +65,9 @@ var Bindings = &bindings{
 	{gocui.KeyCtrlA, "Ctrl+a", "Update Response", nil, onUpdateResponse},
 	{gocui.KeyCtrlR, "Ctrl+r", "Reset Request history", nil, onResetRequests},
 	{gocui.KeyCtrlS, "Ctrl+s", "Save Response as", nil, onSaveResponseAs},
-	{gocui.KeyCtrlF, "Ctrl+f", "Save Request as", nil, onSaveRequestAs},
+	{gocui.KeyCtrlF, "Ctrl+f", "Save Request ENCRYPTED as", nil, onSaveRequestAs},
+	{gocui.KeyCtrlX, "Ctrl+x", "Export Request TOKENIZED as", nil, onExportRequestAs},
+	{gocui.KeyCtrlE, "Ctrl+e", "Reveal sensitive (short TTL)", nil, onRevealSensitive},
 	{gocui.KeyCtrlL, "Ctrl+l", "Toggle Responses list", nil, onToggleResponsesList},
 	{gocui.KeyCtrlT, "Ctrl+t", "Toggle Response builder", nil, onToggleResponseBuilder},
 	{gocui.KeyCtrlO, "Ctrl+o", "Open Body file...", nil, onOpenFile},
@@ -86,7 +88,7 @@ func onNextView(ui *UI) ActionFn {
 func onUpdateResponse(ui *UI) ActionFn {
 	return func(g *gocui.Gui, v *gocui.View) error {
 		if err := ui.updateResponse(g); err != nil {
-			ui.Info(g, err.Error())
+			ui.Info(g, "%s", err.Error())
 		} else {
 			ui.Info(g, "Response updated!")
 		}
@@ -112,10 +114,22 @@ func onSaveRequestAs(ui *UI) ActionFn {
 	}
 }
 
+func onExportRequestAs(ui *UI) ActionFn {
+	return func(g *gocui.Gui, v *gocui.View) error {
+		return ui.exportRequestPopup(g)
+	}
+}
+
+func onRevealSensitive(ui *UI) ActionFn {
+	return func(g *gocui.Gui, v *gocui.View) error {
+		return ui.revealCurrent(g)
+	}
+}
+
 func onToggleResponsesList(ui *UI) ActionFn {
 	return func(g *gocui.Gui, v *gocui.View) error {
 		if err := ui.toggleResponsesLoader(g); err != nil {
-			ui.Info(g, err.Error())
+			ui.Info(g, "%s", err.Error())
 		}
 		return nil
 	}
@@ -124,7 +138,7 @@ func onToggleResponsesList(ui *UI) ActionFn {
 func onToggleResponseBuilder(ui *UI) ActionFn {
 	return func(g *gocui.Gui, v *gocui.View) error {
 		if err := ui.toggleResponseBuilder(g); err != nil {
-			ui.Info(g, err.Error())
+			ui.Info(g, "%s", err.Error())
 		}
 		return nil
 	}

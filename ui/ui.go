@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gchaincl/httplab"
+	"github.com/gchaincl/httplab/security"
 	"github.com/jroimartin/gocui"
 )
 
@@ -75,13 +76,20 @@ type UI struct {
 	configPath          string
 	hideResponseBuilder bool
 	cursors             Cursors
+	guard               *security.Guard
 
 	reqLock        sync.Mutex
-	requests       [][]byte
+	requests       []*httplab.Capture
 	currentRequest int
+
+	// Short-term reveal authorization: only the request identified by
+	// revealID is shown unmasked, and only until revealUntil.
+	revealID    string
+	revealUntil time.Time
+	revealTimer *time.Timer
 }
 
-func New(configPath string) *UI {
+func New(configPath string, guard *security.Guard) *UI {
 	return &UI{
 		resp: &httplab.Response{
 			Status: 200,
@@ -96,6 +104,7 @@ func New(configPath string) *UI {
 		responses:  httplab.NewResponsesList(),
 		configPath: configPath,
 		cursors:    NewCursors(),
+		guard:      guard,
 	}
 }
 
@@ -153,30 +162,128 @@ func (ui *UI) AddRequest(g *gocui.Gui, req *http.Request) error {
 	ui.reqLock.Lock()
 	defer ui.reqLock.Unlock()
 
-	ui.Info(g, "New Request from "+req.Host)
-	buf, err := httplab.DumpRequest(req)
+	ui.Info(g, "%s", "New Request from "+req.Host)
+
+	// Collection boundary: the request is rendered once, classified and
+	// tagged with sensitive spans here; downstream code only ever sees the
+	// Capture.
+	captured, err := httplab.CaptureRequest(req, ui.guard.Policy)
 	if err != nil {
 		return err
 	}
+	captured.ID = fmt.Sprintf("req-%d", len(ui.requests)+1)
 
 	if ui.currentRequest == len(ui.requests)-1 {
 		ui.currentRequest = ui.currentRequest + 1
 	}
 
-	ui.requests = append(ui.requests, buf)
+	ui.requests = append(ui.requests, captured)
+
+	// Persist an envelope-encrypted copy into the managed capture store.
+	// Failures never block request handling.
+	if ui.guard.Store != nil {
+		if _, err := ui.guard.Store.Persist(captured.Record()); err != nil {
+			ui.Info(g, "%s", "encrypted capture failed: "+err.Error())
+		}
+	}
+
 	return ui.updateRequest(g)
 }
 
 func (ui *UI) updateRequest(g *gocui.Gui) error {
-	req := ui.requests[ui.currentRequest]
+	captured := ui.requests[ui.currentRequest]
 
 	view, err := g.View(REQUEST_VIEW)
 	if err != nil {
 		return err
 	}
 
-	view.Title = fmt.Sprintf("Request (%d/%d)", ui.currentRequest+1, len(ui.requests))
-	return ui.Display(g, REQUEST_VIEW, req)
+	revealed := ui.isRevealed(captured)
+	title := fmt.Sprintf("Request (%d/%d)", ui.currentRequest+1, len(ui.requests))
+	if masked := captured.MaskedCount(); masked > 0 {
+		if revealed {
+			title += fmt.Sprintf(" %d REVEALED until %s", masked, ui.revealUntil.Format("15:04:05"))
+		} else {
+			title += fmt.Sprintf(" %d masked", masked)
+		}
+	}
+	view.Title = title
+	return ui.Display(g, REQUEST_VIEW, captured.Render(!revealed))
+}
+
+// isRevealed reports whether the capture currently holds a valid short-term
+// reveal grant.
+func (ui *UI) isRevealed(c *httplab.Capture) bool {
+	return ui.revealID != "" && c.ID == ui.revealID && ui.guard.Now().Before(ui.revealUntil)
+}
+
+// clearReveal drops any active grant and cancels its auto re-mask timer.
+// Callers must hold ui.reqLock.
+func (ui *UI) clearReveal() {
+	ui.revealID = ""
+	ui.revealUntil = time.Time{}
+	if ui.revealTimer != nil {
+		ui.revealTimer.Stop()
+		ui.revealTimer = nil
+	}
+}
+
+// revealCurrent grants a short, audited window in which the sensitive
+// values of the *current* request are displayed. The window expires
+// automatically and is revoked as soon as the user navigates away.
+func (ui *UI) revealCurrent(g *gocui.Gui) error {
+	ui.reqLock.Lock()
+	defer ui.reqLock.Unlock()
+
+	if len(ui.requests) == 0 {
+		ui.Info(g, "%s", "No Requests to reveal")
+		return nil
+	}
+
+	captured := ui.requests[ui.currentRequest]
+	sensitive := captured.SensitiveSpans()
+	if len(security.MergeSpans(sensitive, len(captured.Plain))) == 0 {
+		ui.Info(g, "%s", "No sensitive fields classified in this request")
+		return nil
+	}
+
+	ttl := ui.guard.RevealTTL()
+	ui.revealID = captured.ID
+	ui.revealUntil = ui.guard.Now().Add(ttl)
+
+	ui.guard.RecordEvent(security.Event{
+		Action:     security.AuditReveal,
+		RequestID:  captured.ID,
+		Method:     captured.Method,
+		URI:        captured.URI,
+		RemoteAddr: captured.RemoteAddr,
+		Spans:      ui.guard.Snapshots(captured.Plain, sensitive),
+	})
+
+	if err := ui.updateRequest(g); err != nil {
+		return err
+	}
+	ui.Info(g, "Sensitive values revealed for %s (audit logged)", ttl)
+
+	if ui.revealTimer != nil {
+		ui.revealTimer.Stop()
+	}
+	ui.revealTimer = time.AfterFunc(ttl, func() {
+		g.Execute(func(g *gocui.Gui) error {
+			ui.reqLock.Lock()
+			defer ui.reqLock.Unlock()
+			if ui.revealID == "" {
+				return nil
+			}
+			ui.clearReveal()
+			if err := ui.updateRequest(g); err != nil {
+				return err
+			}
+			ui.Info(g, "%s", "Reveal window expired - sensitive values masked again")
+			return nil
+		})
+	})
+	return nil
 }
 
 func (ui *UI) resetRequests(g *gocui.Gui) error {
@@ -184,6 +291,7 @@ func (ui *UI) resetRequests(g *gocui.Gui) error {
 	defer ui.reqLock.Unlock()
 	ui.requests = nil
 	ui.currentRequest = 0
+	ui.clearReveal()
 
 	v, err := g.View(REQUEST_VIEW)
 	if err != nil {
@@ -192,7 +300,7 @@ func (ui *UI) resetRequests(g *gocui.Gui) error {
 
 	v.Title = "Request"
 	v.Clear()
-	ui.Info(g, "Requests cleared")
+	ui.Info(g, "%s", "Requests cleared")
 	return nil
 }
 
@@ -361,6 +469,7 @@ func (ui *UI) prevRequest(g *gocui.Gui) error {
 		return nil
 	}
 
+	ui.clearReveal()
 	ui.currentRequest = ui.currentRequest - 1
 	return ui.updateRequest(g)
 }
@@ -373,6 +482,7 @@ func (ui *UI) nextRequest(g *gocui.Gui) error {
 		return nil
 	}
 
+	ui.clearReveal()
 	ui.currentRequest = ui.currentRequest + 1
 	return ui.updateRequest(g)
 }
@@ -613,7 +723,7 @@ func (ui *UI) openSavePopup(g *gocui.Gui, title string, fn func(*gocui.Gui, stri
 	onEnter := func(g *gocui.Gui, v *gocui.View) error {
 		value := strings.Trim(v.Buffer(), " \n")
 		if err := fn(g, value); err != nil {
-			ui.Info(g, err.Error())
+			ui.Info(g, "%s", err.Error())
 		}
 		return ui.closePopup(g, SAVE_VIEW)
 	}
@@ -653,36 +763,91 @@ func (ui *UI) saveResponseAs(g *gocui.Gui, name string) error {
 func (ui *UI) saveRequestPopup(g *gocui.Gui) error {
 	// Only open the popup if there's requests
 	if len(ui.requests) == 0 {
-		ui.Info(g, "No Requests to save")
+		ui.Info(g, "%s", "No Requests to save")
 		return nil
 	}
 
 	fn := func(g *gocui.Gui, name string) error {
-		return ui.saveRequestAs(g, name)
+		return ui.saveRequestEncrypted(g, name)
 	}
 
-	return ui.openSavePopup(g, "Save Request as...", fn)
+	return ui.openSavePopup(g, "Encrypt & Save Request as...", fn)
 }
 
-func (ui *UI) saveRequestAs(g *gocui.Gui, name string) error {
+// saveRequestEncrypted persists the current request using envelope
+// encryption (fresh DEK wrapped by the local KEK). The raw secret bytes
+// never touch the file.
+func (ui *UI) saveRequestEncrypted(g *gocui.Gui, name string) error {
 	ui.reqLock.Lock()
 	defer ui.reqLock.Unlock()
 	if len(ui.requests) == 0 {
 		return nil
 	}
-	req := ui.requests[ui.currentRequest]
+	captured := ui.requests[ui.currentRequest]
 
-	file, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	blob, err := ui.guard.Keys.Seal(captured.PlainCopy(), 0, ui.guard.Now())
 	if err != nil {
 		return err
 	}
-	defer file.Close()
 
-	if _, err := file.Write(httplab.Decolorize(req)); err != nil {
+	if err := os.WriteFile(name, blob, 0600); err != nil {
 		return err
 	}
 
-	ui.Info(g, "Request saved as '%s'", name)
+	ui.guard.RecordEvent(security.Event{
+		Action:     security.AuditSaveEncrypted,
+		RequestID:  captured.ID,
+		Method:     captured.Method,
+		URI:        captured.URI,
+		RemoteAddr: captured.RemoteAddr,
+		Spans:      ui.guard.Snapshots(captured.Plain, captured.SensitiveSpans()),
+		Detail:     "file: " + name,
+	})
+
+	ui.Info(g, "Request envelope-encrypted and saved as '%s' (0600)", name)
+	return nil
+}
+
+func (ui *UI) exportRequestPopup(g *gocui.Gui) error {
+	if len(ui.requests) == 0 {
+		ui.Info(g, "%s", "No Requests to export")
+		return nil
+	}
+
+	fn := func(g *gocui.Gui, name string) error {
+		return ui.exportRequestTokenized(g, name)
+	}
+
+	return ui.openSavePopup(g, "Export tokenized Request as...", fn)
+}
+
+// exportRequestTokenized writes the current request with every sensitive
+// value replaced by an irreversible, deterministic HMAC token. The original
+// secrets can not be recovered from the export.
+func (ui *UI) exportRequestTokenized(g *gocui.Gui, name string) error {
+	ui.reqLock.Lock()
+	defer ui.reqLock.Unlock()
+	if len(ui.requests) == 0 {
+		return nil
+	}
+	captured := ui.requests[ui.currentRequest]
+
+	tokenized := ui.guard.Tokens.Apply(captured.PlainCopy(), captured.SensitiveSpans())
+	if err := os.WriteFile(name, tokenized, 0600); err != nil {
+		return err
+	}
+
+	ui.guard.RecordEvent(security.Event{
+		Action:     security.AuditExport,
+		RequestID:  captured.ID,
+		Method:     captured.Method,
+		URI:        captured.URI,
+		RemoteAddr: captured.RemoteAddr,
+		Spans:      ui.guard.Snapshots(captured.Plain, captured.SensitiveSpans()),
+		Detail:     "file: " + name,
+	})
+
+	ui.Info(g, "Tokenized (irreversible) export saved as '%s' (0600)", name)
 	return nil
 }
 
